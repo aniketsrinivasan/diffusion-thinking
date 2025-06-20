@@ -1,0 +1,10 @@
+.env
+.venv
+.idea
+testing_runs/
+experiments/
+notebooks/
+data/
+outputs/
+slurm-*
+nodefile.txt

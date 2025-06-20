@@ -1,0 +1,11 @@
+openai~=1.88.0
+anthropic~=0.54.0
+aiohttp~=3.12.13
+requests~=2.32.4
+together~=1.5.16
+pyarrow~=20.0.0
+sympy~=1.13.3
+accelerate~=1.7.0
+transformers
+omegaconf
+git+https://github.com/purdue-tlt/latex2sympy.git

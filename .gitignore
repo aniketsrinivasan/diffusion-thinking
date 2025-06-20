@@ -8,3 +8,4 @@ data/
 outputs/
 slurm-*
 nodefile.txt
+*__pycache__*

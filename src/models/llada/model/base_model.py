@@ -33,11 +33,21 @@ class BaseModel(ABC):
         """
         Load the LLaDa model and tokenizer. 
         """
-        self.model = AutoModel.from_pretrained(
-            self.config.model_name, 
-            trust_remote_code=self.config.trust_remote_code, 
-            torch_dtype=self.dtype
-        ).to(self.config.device)
+        # AutoModelForCausalLM is used for models that need generation capability
+        try:
+            from transformers import AutoModelForCausalLM
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name, 
+                trust_remote_code=self.config.trust_remote_code, 
+                torch_dtype=self.dtype
+            ).to(self.config.device)
+        except Exception:
+            # AutoModel is used for models that don't support causal LM
+            self.model = AutoModel.from_pretrained(
+                self.config.model_name, 
+                trust_remote_code=self.config.trust_remote_code, 
+                torch_dtype=self.dtype
+            ).to(self.config.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.config.model_name, 
@@ -209,12 +219,40 @@ class BaseModel(ABC):
         input_ids = torch.tensor(input_ids).to(self.config.device).unsqueeze(0)
         return input_ids
     
-    @abstractmethod
     def generate(self, prompt: str, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Generate a sequence of prediction_ids from the model, given a natural language prompt as a string.
+        
+        Args:
+            prompt: The input prompt string
+            **kwargs: Generation parameters (max_length, temperature, etc.)
+            
+        Returns:
+            tuple: (generated_tokens, input_tokens)
+                - generated_tokens: Generated tokens [1, seq_len]
+                - input_tokens: Input tokens [1, input_len]
         """
-        pass
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+        prompt_ids = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        input_ids = self.tokenizer(prompt_ids)['input_ids']
+        input_ids = torch.tensor(input_ids).to(self.config.device).unsqueeze(0)
+        
+        generation_kwargs = {
+            'temperature': 0.5,
+            'do_sample': True,
+            'pad_token_id': self.tokenizer.eos_token_id,
+            **kwargs  # override defaults with kwargs if necessary
+        }
+        
+        with torch.no_grad():
+            generated_ids = self.model.generate(
+                input_ids,
+                **generation_kwargs
+            )
+
+        return generated_ids[:, input_ids.shape[1]:], input_ids
 
     def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
         """

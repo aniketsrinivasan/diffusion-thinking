@@ -1,17 +1,31 @@
 import torch
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
-from src.models.llada.loss.loss_metrics import MathCorrectnessMetric, MathFormatMetric, MathEvalMetric
+from src.models.llada.loss.loss_metrics import MathCorrectnessMetric, MathFormatMetric, MathEvalMetric, LengthRewardMetric, AntiGamingMetric, MathSimilarityMetric
 
 
 @dataclass
 class GRPOLossConfig:
-    use_math_eval: bool = True  # whether to use mathematical evaluations (numerical evaluation correctness)
-    use_math_correctness: bool = True  # whether to use mathematical correctness (correctness of the mathematical expression)
-    use_math_format: bool = True  # whether to use mathematical format (format of the mathematical expression)
     clip_epsilon: float = 0.2  # epsilon for the clipped objective
-    kl_beta: float = 0.02  # beta for the KL divergence penalty
-    regex_match: str = r"\\begin{equation}(.+?)\\end{equation}"  # regex to match the mathematical expression solution
+    kl_beta: float = 0.2  # beta for the KL divergence penalty
+    regex_match: Optional[str] = None  # regex to match the mathematical expression solution
+    use_boxed: bool = True  # whether to use boxed content for the mathematical expression solution
+    
+    # metric weights
+    math_eval_weight: Optional[Tuple[float, float]] = (-1.0, 1.0)
+    math_correctness_weight: Optional[Tuple[float, float]] = (-1.0, 1.0)
+    math_format_weight: Optional[Tuple[float, float]] = (-1.0, 1.0)
+    length_reward_weight: Optional[Tuple[float, float]] = (-1.0, 1.0)
+    anti_gaming_weight: Optional[Tuple[float, float]] = (-5.0, 0.0)  # Strong penalty for gaming
+    math_similarity_weight: Optional[Tuple[float, float]] = (-1.0, 1.0)
+    
+    # anti-gaming specific settings
+    anti_gaming_strong_penalty: bool = True  # whether to use strong penalties for gaming
+    
+    # math similarity specific settings
+    similarity_threshold: float = 0.7  # minimum similarity for partial credit
+    partial_credit: bool = True  # whether to give partial credit for structurally similar expressions
 
 
 class GRPOLoss:
@@ -27,10 +41,21 @@ class GRPOLoss:
         """
         self.config = config
         self.reward_functions = [
-            MathEvalMetric(self.config.regex_match) if self.config.use_math_eval else None,
-            MathCorrectnessMetric(self.config.regex_match) if self.config.use_math_correctness else None,
-            MathFormatMetric(self.config.regex_match) if self.config.use_math_format else None,
+            MathEvalMetric(use_boxed=self.config.use_boxed, regex_match=self.config.regex_match, weight=self.config.math_eval_weight) if self.config.math_eval_weight is not None else None,
+            MathCorrectnessMetric(use_boxed=self.config.use_boxed, regex_match=self.config.regex_match, weight=self.config.math_correctness_weight) if self.config.math_correctness_weight is not None else None,
+            MathFormatMetric(use_boxed=self.config.use_boxed, regex_match=self.config.regex_match, weight=self.config.math_format_weight) if self.config.math_format_weight is not None else None,
+            LengthRewardMetric(weight=self.config.length_reward_weight) if self.config.length_reward_weight is not None else None,
+            AntiGamingMetric(weight=self.config.anti_gaming_weight) if self.config.anti_gaming_weight is not None else None,
+            MathSimilarityMetric(use_boxed=self.config.use_boxed, weight=self.config.math_similarity_weight, similarity_threshold=self.config.similarity_threshold, partial_credit=self.config.partial_credit) if self.config.math_similarity_weight is not None else None,
         ]
+        self.total_weight = sum(
+            [
+                self.config.math_eval_weight[1] if self.config.math_eval_weight is not None else 0,
+                self.config.math_correctness_weight[1] if self.config.math_correctness_weight is not None else 0,
+                self.config.math_format_weight[1] if self.config.math_format_weight is not None else 0,
+                self.config.length_reward_weight[1] if self.config.length_reward_weight is not None else 0,
+            ]
+        )
 
     def get_reward(self, model_output: str, ground_truth: dict) -> torch.Tensor:
         """
@@ -45,9 +70,8 @@ class GRPOLoss:
         """
         reward = torch.tensor(0.0)
         if "".join(model_output).strip() == "":
-            # encourage the model to make a prediction
-            reward -= 1.0
-            return reward
+            empty_penalty = -1.0 * self.total_weight
+            reward += empty_penalty
         for reward_function in self.reward_functions:
             if reward_function is not None:
                 reward += reward_function(model_output, ground_truth)
@@ -93,6 +117,7 @@ class GRPOLoss:
             torch.Tensor: Scalar GRPO loss to minimize [1]
         """
         # get normalized rewards (advantages) for this group
+        group_size = logprobs_new.shape[0]
         with torch.no_grad():
             rewards = self.get_batch_reward(model_outputs, ground_truth).to(logprobs_new.device)  # [B]
             print(f"REWARDS: {rewards}")
@@ -106,14 +131,116 @@ class GRPOLoss:
         clipped_objective = clipped_ratio * advantages
         surrogate_objective = torch.minimum(unclipped_objective, clipped_objective)
 
-        surrogate_loss = surrogate_objective.sum(dim=-1)  # [G]
+        surrogate_loss = surrogate_objective.sum(dim=-1) / group_size  # [G]
 
         kl_divergence = (logprobs_new - logprobs_ref)  # [G, seq_len]
-        kl_divergence = kl_divergence.sum(dim=-1)  # [G]
+        kl_divergence = kl_divergence.sum(dim=-1) / group_size  # [G]
         
         objective = surrogate_loss - self.config.kl_beta * kl_divergence  # [G]
         loss = -objective.mean()
         
+        return loss
+
+    def get_trajectory_loss(
+            self,
+            model_outputs: list[str],
+            ground_truth: dict,
+            traj_new: list[list[dict]],
+            traj_old: list[list[dict]],
+            traj_ref: list[list[dict]],
+    ) -> torch.Tensor:
+        """
+        GRPO loss for a **masked-token diffusion LM** (e.g. LLaDA)
+
+        Parameters
+        ----------
+        model_outputs : list[str]
+            Final decoded answers produced by π_old for this prompt            [G]
+        ground_truth  : dict
+            Ground-truth solution / labels                                     [1]
+        traj_new / traj_old / traj_ref : list[list[dict]]
+            Parallel trajectories for current θ, behaviour (old), and reference
+            models.  Outer list length = G (group size); inner = T steps.
+            Each step-dict MUST contain
+                "logits" : FloatTensor [L, V]      # raw logits for this model/step
+                "mask"   : BoolTensor  [L]         # 1 where tokens denoised at step t
+                "tokens" : LongTensor  [L]         # token ids actually sampled by π_old
+                "noise"  : float (optional)        # 1 − ᾱ_t, used to scale KL
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss – minimise this.
+        """
+
+        # --------------------------------------------------------
+        # 1. Group-relative advantage  (identical to simple loss)
+        # --------------------------------------------------------
+        with torch.no_grad():
+            rewards = self.get_batch_reward(model_outputs, ground_truth)       # [G]
+            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)   # [G]
+
+        eps  = self.config.clip_epsilon
+        beta = self.config.kl_beta
+        device = traj_new[0][0]["logits"].device
+
+        sample_losses = []
+
+        # --------------------------------------------------------
+        # 2. Iterate over diffusion trajectories (one per sample)
+        # --------------------------------------------------------
+        for g_idx, adv in enumerate(advantages):
+            step_losses = []
+            for step_idx in range(len(traj_new[g_idx])):
+
+                # ---- pull tensors for this step / model family
+                logits_new = traj_new[g_idx][step_idx]["logits"]    # [L, V]
+                logits_old = traj_old[g_idx][step_idx]["logits"]
+                logits_ref = traj_ref[g_idx][step_idx]["logits"]
+
+                mask_t   = traj_old[g_idx][step_idx]["mask"].float()      # [L]
+                tokens_t = traj_old[g_idx][step_idx]["tokens"]            # [L]
+                noise    = traj_old[g_idx][step_idx].get("noise", 1.0)    # scalar
+
+                # ---- convert to log-probs
+                logp_new = torch.log_softmax(logits_new, dim=-1)          # [L, V]
+                logp_old = torch.log_softmax(logits_old, dim=-1)
+                logp_ref = torch.log_softmax(logits_ref, dim=-1)
+
+                # ---- gather log-prob for actually sampled ids
+                idx = tokens_t.unsqueeze(-1)                              # [L, 1]
+                lp_new_tok = logp_new.gather(-1, idx).squeeze(-1)         # [L]
+                lp_old_tok = logp_old.gather(-1, idx).squeeze(-1)
+                lp_ref_tok = logp_ref.gather(-1, idx).squeeze(-1)
+
+                # =========================================================
+                # 2a.  PPO-style clipped surrogate  (identical math to simple)
+                # =========================================================
+                ratio        = (lp_new_tok - lp_old_tok).exp()            # [L]
+                masked_adv   = adv.to(device) * mask_t                    # [L]
+
+                unclipped    = ratio * masked_adv
+                clipped      = torch.clamp(ratio, 1 - eps, 1 + eps) * masked_adv
+                surrogate    = torch.minimum(unclipped, clipped).sum()    # scalar
+
+                # =========================================================
+                # 2b.  Noise-aware KL penalty (only on masked positions)
+                # =========================================================
+                kl_step      = ((lp_new_tok - lp_ref_tok) * mask_t).sum()
+                step_loss    = -(surrogate - beta * noise * kl_step)      # maximise → minimise
+                step_losses.append(step_loss)
+
+            # ---- sum losses for this trajectory
+            if step_losses:
+                sample_losses.append(torch.stack(step_losses).sum())
+
+        # --------------------------------------------------------
+        # 3. Aggregate across the group
+        # --------------------------------------------------------
+        if sample_losses:
+            loss = torch.stack(sample_losses).mean()
+        else:
+            loss = torch.tensor(0.0, device=device)
+
         return loss
 
     def __call__(

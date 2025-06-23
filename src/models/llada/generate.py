@@ -44,10 +44,10 @@ def get_num_transfer_tokens(mask_index, steps):
 def generate(
     model, 
     prompt_ids, 
-    steps: int = 128, 
-    gen_length: int = 128, 
-    block_length: int = 128, 
-    temperature: float = 0.3,
+    steps: int = 256, 
+    gen_length: int = 512, 
+    block_length: int = 512, 
+    temperature: float = 0.5,
     cfg_scale: float = 0., 
     remasking: str = 'low_confidence', 
     mask_id: int = 126336

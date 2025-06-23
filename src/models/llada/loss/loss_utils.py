@@ -74,3 +74,35 @@ class LossUtils:
             print(f"Error in sympy equality check: {e}")
             return model_output.strip() == ground_truth.strip()
     
+    @staticmethod
+    def extract_boxed_content(text: str) -> str:
+        """
+        Extract the LaTeX content inside \\boxed{} from a string.
+        Handles nested braces correctly.
+        
+        Args:
+            text: Input string that may contain \\boxed{...} pattern
+            
+        Returns:
+            str: The content inside \\boxed{}, or empty string if not found
+        """
+        boxed_start = text.find(r'\boxed{')
+        if boxed_start == -1:
+            return ""
+        
+        start_pos = boxed_start + len(r'\boxed{')
+        brace_count = 1
+        current_pos = start_pos
+        
+        while current_pos < len(text) and brace_count > 0:
+            char = text[current_pos]
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+            current_pos += 1
+        
+        if brace_count == 0:
+            return text[start_pos:current_pos-1]
+        
+        return ""
